@@ -1,0 +1,106 @@
+//@version=6
+// Ray DCA v1 — translates the live bot's mechanics to Pine v6 for backtest cross-validation.
+// Entry: 24h-high * (1 - dip_threshold). Stack up to max_layers on each dip.
+// Exit:  weighted-avg-entry * (1 + tp_threshold). Closes ALL layers, resets state.
+// No stop loss by design. Cap is the only risk control.
+//
+// Fee model: 0.04% per side (BINANCE perp taker). Funding NOT modeled — caveat in WHERE-WRONG.
+// Bar granularity: this script runs on whatever the chart is set to. Spec says 1h.
+strategy("Ray DCA v1",
+     overlay=true,
+     initial_capital=10000,
+     default_qty_type=strategy.fixed,
+     default_qty_value=1,
+     commission_type=strategy.commission.percent,
+     commission_value=0.04,
+     pyramiding=10,
+     process_orders_on_close=true,
+     calc_on_every_tick=false)
+
+// === Inputs (defaults match the live Ray DCA bot) ===
+dip_threshold     = input.float(0.01,  "Dip threshold (1% = 0.01)",    minval=0.001, maxval=0.10, step=0.001)
+tp_threshold      = input.float(0.008, "TP threshold (0.8% = 0.008)",  minval=0.001, maxval=0.10, step=0.001)
+max_layers        = input.int(10,      "Max DCA layers",               minval=1,     maxval=50)
+base_position_usd = input.float(50.0,  "Base USD per layer",           minval=1)
+lookback_24h      = input.int(24,      "Bars for 24h high (1h chart: 24)", minval=1)
+
+// === State ===
+var array<float> layer_prices    = array.new<float>()
+var array<float> layer_sizes     = array.new<float>()
+var float        weighted_avg    = na
+var float        tp_level        = na
+var int          cycles_done     = 0
+var int          cap_hits        = 0
+var bool         cycle_hit_cap   = false
+var int          cycle_start_bar = na
+var array<int>   cycle_durations = array.new<int>()
+
+// === Entry signal: 24h-high dip ===
+high_24h        = ta.highest(high, lookback_24h)
+entry_level     = high_24h * (1 - dip_threshold)
+current_layers  = array.size(layer_prices)
+
+if current_layers < max_layers and close <= entry_level
+    layer_size = base_position_usd / close
+    strategy.entry("L" + str.tostring(current_layers + 1), strategy.long, qty=layer_size)
+    array.push(layer_prices, close)
+    array.push(layer_sizes,  layer_size)
+    if current_layers == 0
+        cycle_start_bar := bar_index
+        cycle_hit_cap   := false
+    if array.size(layer_prices) >= max_layers
+        cycle_hit_cap := true
+
+// === Recompute weighted average + TP level after any new entry ===
+if array.size(layer_prices) > 0
+    total_value = 0.0
+    total_size  = 0.0
+    for i = 0 to array.size(layer_prices) - 1
+        total_value += array.get(layer_prices, i) * array.get(layer_sizes, i)
+        total_size  += array.get(layer_sizes, i)
+    weighted_avg := total_value / total_size
+    tp_level     := weighted_avg * (1 + tp_threshold)
+else
+    weighted_avg := na
+    tp_level     := na
+
+// === Exit: weighted-avg * (1 + tp_threshold) → close all layers ===
+if array.size(layer_prices) > 0 and not na(tp_level) and close >= tp_level
+    strategy.close_all(comment="TP")
+    cycles_done += 1
+    if cycle_hit_cap
+        cap_hits += 1
+    if not na(cycle_start_bar)
+        array.push(cycle_durations, bar_index - cycle_start_bar)
+    array.clear(layer_prices)
+    array.clear(layer_sizes)
+    weighted_avg    := na
+    tp_level        := na
+    cycle_hit_cap   := false
+    cycle_start_bar := na
+
+// === Visualization ===
+plot(entry_level,  "24h dip level", color=color.new(color.green, 60), linewidth=1)
+plot(weighted_avg, "Weighted avg",  color=color.new(color.blue,  30), linewidth=2)
+plot(tp_level,     "TP level",      color=color.new(color.red,   30), linewidth=2)
+
+// === Custom metrics table (read via data_get_pine_tables for backtest output) ===
+var table summary = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 80), border_width=1)
+if barstate.islast
+    table.cell(summary, 0, 0, "Ray DCA v1",          text_color=color.yellow, bgcolor=color.new(color.navy, 30))
+    table.cell(summary, 1, 0, "value",               text_color=color.yellow, bgcolor=color.new(color.navy, 30))
+    table.cell(summary, 0, 1, "Cycles completed",    text_color=color.white)
+    table.cell(summary, 1, 1, str.tostring(cycles_done),                                                 text_color=color.white)
+    table.cell(summary, 0, 2, "Cap hits (10 layers)",text_color=color.white)
+    table.cell(summary, 1, 2, str.tostring(cap_hits),                                                    text_color=color.white)
+    avg_dur = array.size(cycle_durations) > 0 ? array.avg(cycle_durations) : na
+    table.cell(summary, 0, 3, "Avg cycle (bars)",    text_color=color.white)
+    table.cell(summary, 1, 3, na(avg_dur) ? "—" : str.tostring(avg_dur, "#.##"),                         text_color=color.white)
+    table.cell(summary, 0, 4, "Open layers",         text_color=color.white)
+    table.cell(summary, 1, 4, str.tostring(array.size(layer_prices)),                                    text_color=color.white)
+    cap_rate = cycles_done > 0 ? (cap_hits / cycles_done) * 100 : 0.0
+    table.cell(summary, 0, 5, "Cap-hit rate",        text_color=color.white)
+    table.cell(summary, 1, 5, str.tostring(cap_rate, "#.##") + "%",                                      text_color=color.white)
+    net_pct = strategy.netprofit / strategy.initial_capital * 100
+    table.cell(summary, 0, 6, "Net % (initial cap)", text_color=color.white)
+    table.cell(summary, 1, 6, str.tostring(net_pct, "#.##") + "%",                                       text_color=color.white)
