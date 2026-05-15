@@ -1,0 +1,52 @@
+//@version=6
+// Ray DCA Replica — V2.1
+//
+// Corrects two V2 spec gaps that caused the V2 stuck-cap-hit failure
+// (see docs/ray_dca_pine_v6_backtest_may15.md commit d6cedd5):
+//
+//   1. TP threshold is 0.005 (0.5%) not 0.008 (0.8%) — easier to hit on
+//      modest recoveries → unsticks cap-hit cycles.
+//   2. Layer spacing uses last_entry_price × 0.99, NOT high_24h × 0.99
+//      for subsequent layers. Only the FIRST layer uses 24h-high dip.
+//      Subsequent layers require price to drop another 1% from the
+//      previous layer's fill — preserving meaningful layer spread.
+//
+// Pulls 5-min mark + 24h high via request.security regardless of chart
+// resolution, so the chart timeframe can be widened to fit longer
+// windows within Premium 20K bar limit while preserving 5-min strategy
+// fidelity (lookback 288 × 5min = 24h).
+//
+// Fee model: NOT included by drop-in. Documented in WHERE-WRONG.
+// Funding: NOT modeled. Documented in WHERE-WRONG.
+strategy("Ray DCA Replica — V2.1", overlay=true,
+         initial_capital=500, default_qty_type=strategy.fixed,
+         process_orders_on_close=true, calc_on_every_tick=false)
+
+LAYER_SIZE     = input.float(0.007,  "Layer size (base units)")
+MAX_LAYERS     = input.int(10,       "Max layers")
+TP_PCT         = input.float(0.005,  "TP from avg entry (frac)")
+ENTRY_BELOW    = input.float(0.01,   "First layer: % below 24h high")
+DROP_PER_LAYER = input.float(0.01,   "Layer spacing: % below previous layer")
+
+[h24, mark] = request.security(syminfo.tickerid, "5",
+    [ta.highest(high, 288), close], lookahead=barmerge.lookahead_off)
+
+var int   layer_count      = 0
+var float last_entry_price = na
+
+avg_entry = strategy.position_size > 0 ? strategy.position_avg_price : na
+
+tp_trig = strategy.position_size > 0 and not na(avg_entry) and mark >= avg_entry * (1 + TP_PCT)
+if tp_trig
+    strategy.close_all(comment="TP")
+    layer_count      := 0
+    last_entry_price := na
+
+flat        = strategy.position_size == 0
+first_entry = flat and mark <= h24 * (1 - ENTRY_BELOW)
+next_layer  = not flat and layer_count < MAX_LAYERS and mark <= last_entry_price * (1 - DROP_PER_LAYER)
+
+if first_entry or next_layer
+    strategy.entry("L" + str.tostring(layer_count + 1), strategy.long, qty=LAYER_SIZE)
+    layer_count      := layer_count + 1
+    last_entry_price := mark
